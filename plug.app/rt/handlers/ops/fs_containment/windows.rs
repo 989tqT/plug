@@ -13,9 +13,16 @@ const STATUS_OBJECT_NAME_NOT_FOUND: i32 = -1073741772; // 0xc0000034
 const STATUS_OBJECT_PATH_NOT_FOUND: i32 = -1073741766; // 0xc000003a
 const STATUS_ACCESS_DENIED: i32 = -1073741790; // 0xc0000022
 const STATUS_OBJECT_NAME_COLLISION: i32 = -1073741771; // 0xc0000035
+const STATUS_SHARING_VIOLATION: i32 = -1073741757; // 0xc0000043
+const STATUS_DELETE_PENDING: i32 = -1073741738; // 0xc0000056
+const STATUS_PRIVILEGE_NOT_HELD: i32 = -1073741727; // 0xc0000061
 const STATUS_DIRECTORY_NOT_EMPTY: i32 = -1073741567; // 0xc0000101
 const STATUS_NOT_A_DIRECTORY: i32 = -1073741565; // 0xc0000103
+const STATUS_NAME_TOO_LONG: i32 = -1073741562; // 0xc0000106
 const STATUS_FILE_IS_A_DIRECTORY: i32 = -1073741638; // 0xc00000ba
+const STATUS_CANNOT_DELETE: i32 = -1073741535; // 0xc0000121
+const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = -1073741195; // 0xc0000275
+const STATUS_STOPPED_ON_SYMLINK: i32 = -2147483603; // 0x8000002d
 
 // access right
 const FILE_READ_DATA: u32 = 0x0001;
@@ -146,6 +153,13 @@ extern "system" {
         dw_flags: u32,
     ) -> u32;
 
+    fn SetFilePointer(
+        h_file: *mut std::ffi::c_void,
+        l_distance_to_move: i32,
+        lp_distance_to_move_high: *mut i32,
+        dw_move_method: u32,
+    ) -> u32;
+
     fn SetEndOfFile(h_file: *mut std::ffi::c_void) -> i32;
     fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
 }
@@ -159,12 +173,15 @@ extern "C" {
 pub fn map_ntstatus_to_wasi(status: i32) -> i32 {
     match status {
         STATUS_SUCCESS => WASI_ESUCCESS,
-        STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => WASI_ENOENT,
-        STATUS_ACCESS_DENIED => WASI_EACCES,
+        STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND | STATUS_DELETE_PENDING => WASI_ENOENT,
+        STATUS_ACCESS_DENIED | STATUS_SHARING_VIOLATION => WASI_EACCES,
+        STATUS_PRIVILEGE_NOT_HELD | STATUS_CANNOT_DELETE => WASI_EPERM,
         STATUS_OBJECT_NAME_COLLISION => WASI_EEXIST,
         STATUS_NOT_A_DIRECTORY => WASI_ENOTDIR,
         STATUS_FILE_IS_A_DIRECTORY => WASI_EISDIR,
         STATUS_DIRECTORY_NOT_EMPTY => WASI_ENOTEMPTY,
+        STATUS_NAME_TOO_LONG => WASI_EINVAL,
+        STATUS_REPARSE_POINT_ENCOUNTERED | STATUS_STOPPED_ON_SYMLINK => WASI_ENOTCAPABLE,
         _ => WASI_EIO,
     }
 }
@@ -200,6 +217,17 @@ fn get_canonical_handle_path(handle: *mut std::ffi::c_void) -> Option<PathBuf> {
         p = stripped.to_path_buf();
     }
     Some(p)
+}
+
+// normalize path for comparison with lowercasing and separator canonicalization
+fn normalize_path_for_compare(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy().to_lowercase();
+    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest
+    } else {
+        &s
+    };
+    PathBuf::from(stripped.replace('/', "\\"))
 }
 
 // validate single path component
@@ -383,6 +411,13 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         let root_handle = resolve_raw_handle(root_fd)?;
         let components = parse_relative_components(rel_path)?;
 
+        let mut root_info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+        let root_ok = unsafe { GetFileInformationByHandle(root_handle, root_info.as_mut_ptr()) };
+        if root_ok == 0 {
+            return Err(WASI_EBADF);
+        }
+        let root_info = unsafe { root_info.assume_init() };
+
         let (parent_handle, leaf_name, should_close_parent) = if components.len() == 1 {
             (root_handle, components[0], false)
         } else {
@@ -401,10 +436,7 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             if flags.read {
                 acc |= FILE_GENERIC_READ;
             }
-            if flags.write {
-                acc |= FILE_GENERIC_WRITE;
-            }
-            if flags.create {
+            if flags.write || flags.create || flags.truncate {
                 acc |= FILE_GENERIC_WRITE;
             }
 
@@ -439,6 +471,7 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         }
         let info = unsafe { info.assume_init() };
 
+        // reject reparse point
         if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             unsafe { NtClose(leaf_handle) };
             return Err(WASI_ENOTCAPABLE);
@@ -451,10 +484,18 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             return Err(WASI_ENOTCAPABLE);
         }
 
-        // canonical boundary verification
+        // volume cross device check
+        if info.dw_volume_serial_number != root_info.dw_volume_serial_number {
+            unsafe { NtClose(leaf_handle) };
+            return Err(WASI_ENOTCAPABLE);
+        }
+
+        // canonical boundary verification with lowercased path comparison
         if let Some(root_path) = get_canonical_handle_path(root_handle) {
             if let Some(leaf_path) = get_canonical_handle_path(leaf_handle) {
-                if !leaf_path.starts_with(&root_path) {
+                let norm_root = normalize_path_for_compare(&root_path);
+                let norm_leaf = normalize_path_for_compare(&leaf_path);
+                if !norm_leaf.starts_with(&norm_root) {
                     unsafe { NtClose(leaf_handle) };
                     return Err(WASI_ENOTCAPABLE);
                 }
@@ -464,7 +505,14 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             }
         }
 
+        // deterministic truncate execution on verified handle
+        // move file pointer to offset 0 before setting end of file
         if flags.truncate && !flags.directory {
+            let move_res = unsafe { SetFilePointer(leaf_handle, 0, std::ptr::null_mut(), 0) };
+            if move_res == 0xFFFFFFFF {
+                unsafe { NtClose(leaf_handle) };
+                return Err(WASI_EIO);
+            }
             let ok = unsafe { SetEndOfFile(leaf_handle) };
             if ok == 0 {
                 unsafe { NtClose(leaf_handle) };
@@ -472,7 +520,7 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             }
         }
 
-        let crt_flags = if flags.write { 0x0002 | 0x8000 } else { 0x0000 | 0x8000 };
+        let crt_flags = if flags.write || flags.create || flags.truncate { 0x0002 | 0x8000 } else { 0x0000 | 0x8000 };
         let fd = unsafe { _open_osfhandle(leaf_handle as isize, crt_flags) };
         if fd < 0 {
             unsafe { NtClose(leaf_handle) };
@@ -666,6 +714,67 @@ mod tests {
     }
 
     #[test]
+    fn test_windows_ntstatus_mapping() {
+        assert_eq!(map_ntstatus_to_wasi(STATUS_SUCCESS), WASI_ESUCCESS);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_OBJECT_NAME_NOT_FOUND), WASI_ENOENT);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_OBJECT_PATH_NOT_FOUND), WASI_ENOENT);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_ACCESS_DENIED), WASI_EACCES);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_SHARING_VIOLATION), WASI_EACCES);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_PRIVILEGE_NOT_HELD), WASI_EPERM);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_OBJECT_NAME_COLLISION), WASI_EEXIST);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_NOT_A_DIRECTORY), WASI_ENOTDIR);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_FILE_IS_A_DIRECTORY), WASI_EISDIR);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_DIRECTORY_NOT_EMPTY), WASI_ENOTEMPTY);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_REPARSE_POINT_ENCOUNTERED), WASI_ENOTCAPABLE);
+        assert_eq!(map_ntstatus_to_wasi(STATUS_STOPPED_ON_SYMLINK), WASI_ENOTCAPABLE);
+        assert_eq!(map_ntstatus_to_wasi(99999), WASI_EIO);
+    }
+
+    #[test]
+    fn test_windows_truncate_semantics_deterministic() {
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_trunc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let target_file = temp_dir.join("existing_large.bin");
+        std::fs::write(&target_file, vec![0xAAu8; 512]).unwrap();
+        assert_eq!(std::fs::metadata(&target_file).unwrap().len(), 512);
+
+        use std::os::windows::fs::OpenOptionsExt;
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&temp_dir)
+            .unwrap();
+        use std::os::windows::io::AsRawHandle;
+        let root_handle = root_file.as_raw_handle() as isize;
+        let root_fd = unsafe { _open_osfhandle(root_handle, 0x8000) };
+        assert!(root_fd >= 0);
+
+        let engine = WindowsContainmentEngine::new();
+        let open_flags = OpenFlags {
+            read: true,
+            write: true,
+            create: false,
+            truncate: true,
+            directory: false,
+            follow_symlinks: false,
+        };
+
+        let fd = engine.open_beneath(root_fd, "existing_large.bin", open_flags).expect("truncate open fail");
+        assert!(fd >= 0);
+
+        unsafe { libc::write(fd, b"ABCDE".as_ptr() as *const _, 5) };
+        unsafe { libc::close(fd) };
+
+        let file_bytes = std::fs::read(&target_file).unwrap();
+        assert_eq!(file_bytes.len(), 5, "file was not truncated to zero before write");
+        assert_eq!(file_bytes, b"ABCDE");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn test_windows_ntfs_containment_gates() {
         let temp_dir = std::env::temp_dir().join(format!("plug_win_spike_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -682,7 +791,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         let root_file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
+            .custom_flags(0x02000000)
             .open(&sandbox_dir)
             .unwrap();
         use std::os::windows::io::AsRawHandle;
@@ -733,17 +842,128 @@ mod tests {
         let open_res = engine.open_beneath(root_fd, "hardlinked_sentinel.txt", open_flags_write);
         assert_eq!(open_res, Err(WASI_ENOTCAPABLE), "hard link must be rejected by containment policy");
 
-        // verify sentinel outside sandbox remains completely intact
         let sentinel_content = std::fs::read(&sentinel_path).unwrap();
         assert_eq!(sentinel_content, b"sentinel original content", "outside sentinel was modified by hard link alias");
 
-        // unlink hardlink via engine must also reject
         let unlink_res = engine.unlink_file_beneath(root_fd, "hardlinked_sentinel.txt");
         assert_eq!(unlink_res, Err(WASI_ENOTCAPABLE), "unlink hard link must fail-closed");
         assert_eq!(std::fs::read(&sentinel_path).unwrap(), b"sentinel original content");
 
         // cleanup
         let _ = std::fs::remove_file(&hardlink_in_sandbox);
+        let _ = std::fs::remove_file(&sentinel_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_ntfs_junction_rejection() {
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_junc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let sandbox_dir = temp_dir.join("sandbox");
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let outside_dir = temp_dir.join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let sentinel_path = outside_dir.join("sentinel.txt");
+        std::fs::write(&sentinel_path, b"outside secret data").unwrap();
+
+        let junction_path = sandbox_dir.join("junction_escape");
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("New-Item -ItemType Junction -Path '{}' -Target '{}' -Force -Confirm:$false", junction_path.display(), outside_dir.display())])
+            .status()
+            .expect("invoke powershell junction fail");
+        assert!(status.success(), "failed to create test junction");
+
+        use std::os::windows::fs::OpenOptionsExt;
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&sandbox_dir)
+            .unwrap();
+        use std::os::windows::io::AsRawHandle;
+        let root_handle = root_file.as_raw_handle() as isize;
+        let root_fd = unsafe { _open_osfhandle(root_handle, 0x8000) };
+        assert!(root_fd >= 0);
+
+        let engine = WindowsContainmentEngine::new();
+
+        // attempt to walk through junction to read sentinel
+        let res = engine.open_beneath(root_fd, "junction_escape/sentinel.txt", OpenFlags::default());
+        assert_eq!(res, Err(WASI_ENOTCAPABLE), "junction escape must be denied by handle walking");
+
+        // attempt to open junction itself
+        let junc_open = engine.open_beneath(root_fd, "junction_escape", OpenFlags { directory: true, ..OpenFlags::default() });
+        assert_eq!(junc_open, Err(WASI_ENOTCAPABLE), "junction opening must be denied by reparse check");
+
+        // outside sentinel verified intact
+        assert_eq!(std::fs::read(&sentinel_path).unwrap(), b"outside secret data");
+
+        let _ = std::fs::remove_dir(&junction_path);
+        let _ = std::fs::remove_file(&sentinel_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_concurrent_namespace_mutation() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_stress_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let sandbox_dir = temp_dir.join("sandbox");
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let outside_dir = temp_dir.join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let sentinel_path = outside_dir.join("sentinel.txt");
+        std::fs::write(&sentinel_path, b"unmodified stress sentinel").unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&sandbox_dir)
+            .unwrap();
+        use std::os::windows::io::AsRawHandle;
+        let root_handle = root_file.as_raw_handle() as isize;
+        let root_fd = unsafe { _open_osfhandle(root_handle, 0x8000) };
+        assert!(root_fd >= 0);
+
+        let engine = Arc::new(WindowsContainmentEngine::new());
+        let mut handles = Vec::new();
+
+        for tid in 0..4 {
+            let engine_clone = Arc::clone(&engine);
+            let handle = thread::spawn(move || {
+                for i in 0..50 {
+                    let filename = format!("file_{}_{}.txt", tid, i);
+                    let open_flags = OpenFlags {
+                        read: true,
+                        write: true,
+                        create: true,
+                        truncate: false,
+                        directory: false,
+                        follow_symlinks: false,
+                    };
+                    if let Ok(fd) = engine_clone.open_beneath(root_fd, &filename, open_flags) {
+                        unsafe { libc::write(fd, b"thread payload".as_ptr() as *const _, 14) };
+                        unsafe { libc::close(fd) };
+                        let _ = engine_clone.unlink_file_beneath(root_fd, &filename);
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(std::fs::read(&sentinel_path).unwrap(), b"unmodified stress sentinel");
         let _ = std::fs::remove_file(&sentinel_path);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

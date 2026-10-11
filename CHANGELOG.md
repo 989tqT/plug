@@ -8,6 +8,7 @@
 
 - Added an experimental P1.5 Linux filesystem-containment spike using `openat2()` with `RESOLVE_BENEATH`, `RESOLVE_NO_MAGICLINKS`, and `RESOLVE_NO_SYMLINKS`; directory mutations use safely opened parent descriptors with single-component `mkdirat()` and `unlinkat()`. The spike remains isolated from the production runtime.
 - Added a reproducible standalone Linux containment runner and acceptance tests covering scoped access, traversal and symlink rejection, pinned-parent mutations, outside-sentinel integrity, concurrent namespace mutation, retry exhaustion, and fail-closed behavior when `openat2` is unavailable.
+- Added an experimental P1.5 Windows filesystem-containment feasibility spike using native `NtCreateFile` with parent `RootDirectory` handle walking, single-component lexical validation, `FILE_OPEN_REPARSE_POINT` junction rejection, fail-closed hard-link policy (`NumberOfLinks > 1`), deterministic truncate positioning, and handle-directed atomic deletions via `SetFileInformationByHandle`. The spike remains isolated from the production runtime.
 
 ### Fixed
 
